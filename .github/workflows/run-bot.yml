@@ -141,7 +141,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          sleep 330m
+          sleep 340m
           echo "Starting successor run before the current runner reaches its limit."
           gh workflow run run-bot.yml --repo "$GITHUB_REPOSITORY" --ref dev
         background: true
