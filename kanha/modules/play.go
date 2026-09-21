@@ -557,6 +557,7 @@ func downloadFirstTrack(
 	path, err := downloadTrack(ctx, c, track, replyMsg, chatID)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
+
 			utils.EOR(
 				c,
 				replyMsg,
@@ -564,6 +565,7 @@ func downloadFirstTrack(
 				nil,
 			)
 		} else {
+			logger.Errorf("Download failed for track %q (%s): %v", track.Title, track.URL, err)
 			utils.EOR(c, replyMsg, F(chatID, "play_download_failed"), nil)
 		}
 		return "", err
