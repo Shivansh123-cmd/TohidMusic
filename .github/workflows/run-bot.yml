@@ -1,0 +1,104 @@
+name: Run TohidMusic
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+
+    env:
+      API_ID: ${{ secrets.API_ID }}
+      API_HASH: ${{ secrets.API_HASH }}
+      TOKEN: ${{ secrets.TOKEN }}
+      MONGO_DB_URI: ${{ secrets.MONGO_DB_URI }}
+      STRING_SESSIONS: ${{ secrets.STRING_SESSIONS }}
+      SESSION_TYPE: ${{ secrets.SESSION_TYPE }}
+      DB_NAME: ${{ secrets.DB_NAME }}
+      LOGGER_ID: ${{ secrets.LOGGER_ID }}
+      OWNER_ID: ${{ secrets.OWNER_ID }}
+      OWNER_USERNAME: ${{ secrets.OWNER_USERNAME }}
+      DEV_URL: ${{ secrets.DEV_URL }}
+      DISABLE_COLOUR: ${{ secrets.DISABLE_COLOUR }}
+      MEOW_API_URL: ${{ secrets.MEOW_API_URL }}
+      MEOW_API_KEY: ${{ secrets.MEOW_API_KEY }}
+      DEFAULT_LANG: ${{ secrets.DEFAULT_LANG }}
+      DURATION_LIMIT: ${{ secrets.DURATION_LIMIT }}
+      LEAVE_ON_DEMOTED: ${{ secrets.LEAVE_ON_DEMOTED }}
+      QUEUE_LIMIT: ${{ secrets.QUEUE_LIMIT }}
+      SUPPORT_CHAT: ${{ secrets.SUPPORT_CHAT }}
+      SUPPORT_CHANNEL: ${{ secrets.SUPPORT_CHANNEL }}
+      COOKIES_LINK: ${{ secrets.COOKIES_LINK }}
+      SET_CMDS: ${{ secrets.SET_CMDS }}
+      MAX_AUTH_USERS: ${{ secrets.MAX_AUTH_USERS }}
+      START_IMAGES: ${{ secrets.START_IMAGES }}
+      PING_IMG_URL: ${{ secrets.PING_IMG_URL }}
+      REPO_IMG_URL: ${{ secrets.REPO_IMG_URL }}
+      PORT: 8000
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go 1.26
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl unzip zlib1g-dev ffmpeg
+
+      - name: Install native Telegram dependencies
+        run: |
+          chmod +x install.sh
+          bash install.sh -n -t --quiet --skip-summary
+
+      - name: Install yt-dlp
+        run: |
+          sudo curl -fL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux \
+            -o /usr/local/bin/yt-dlp
+          sudo chmod 0755 /usr/local/bin/yt-dlp
+          yt-dlp --version
+          ffmpeg -version | head -n 1
+          ffprobe -version | head -n 1
+
+      - name: Install Deno
+        run: |
+          curl -fsSL https://deno.land/install.sh -o /tmp/deno-install.sh
+          DENO_INSTALL="$HOME/.deno" sh /tmp/deno-install.sh -y --no-modify-path
+          echo "$HOME/.deno/bin" >> "$GITHUB_PATH"
+          "$HOME/.deno/bin/deno" --version
+
+      - name: Validate required secrets
+        shell: bash
+        run: |
+          missing=()
+          for name in API_ID API_HASH TOKEN MONGO_DB_URI STRING_SESSIONS; do
+            if [[ -z "${!name}" ]]; then
+              missing+=("$name")
+            fi
+          done
+
+          if (( ${#missing[@]} > 0 )); then
+            echo "Missing required GitHub Secrets: ${missing[*]}"
+            exit 1
+          fi
+
+      - name: Download Go modules
+        run: go mod download
+
+      - name: Build bot
+        run: |
+          CGO_ENABLED=1 go build -v -trimpath -ldflags="-w -s" -o app ./cmd/app/
+          test -x ./app
+
+      - name: Start bot
+        run: ./app
