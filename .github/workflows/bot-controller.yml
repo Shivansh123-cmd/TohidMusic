@@ -22,7 +22,7 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      - name: Watch and reconcile bot runners
+      - name: Watch, restart and hand over controller
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
@@ -31,13 +31,27 @@ jobs:
 
           REPO="$GITHUB_REPOSITORY"
           WORKFLOW="run-bot.yml"
+          CONTROLLER_WORKFLOW="bot-controller.yml"
           BRANCH="dev"
-          HANDOVER_MINUTES=335
+          BOT_HANDOVER_MINUTES=335
+          CONTROLLER_HANDOVER_MINUTES=335
+          controller_started="$(date -u +%s)"
+          controller_handover_done=false
 
-          dispatch_new() {
+          dispatch_bot() {
             echo "Dispatching a new bot runner..."
             gh workflow run "$WORKFLOW" --repo "$REPO" --ref "$BRANCH"
-            echo "Dispatch requested."
+            echo "Bot dispatch requested."
+          }
+
+          dispatch_controller() {
+            if [[ "$controller_handover_done" == "true" ]]; then
+              return
+            fi
+            controller_handover_done=true
+            echo "Starting successor controller before this controller reaches its limit..."
+            gh workflow run "$CONTROLLER_WORKFLOW" --repo "$REPO" --ref "$BRANCH"
+            echo "Successor controller dispatch requested."
           }
 
           runs_json() {
@@ -67,14 +81,23 @@ jobs:
               "/repos/$REPO/actions/runs/$run_id/cancel" >/dev/null || true
           }
 
-          echo "Controller started. It will keep watching until the controller job reaches its own limit."
+          echo "Controller started. Bot watchdog and controller self-handover are active."
 
           while true; do
+            controller_now="$(date -u +%s)"
+            controller_age_minutes=$(( (controller_now - controller_started) / 60 ))
+
+            if (( controller_age_minutes >= CONTROLLER_HANDOVER_MINUTES )); then
+              dispatch_controller
+              sleep 30
+              continue
+            fi
+
             active="$(active_json)"
             count="$(jq 'length' <<<"$active")"
 
             if (( count == 0 )); then
-              dispatch_new
+              dispatch_bot
               sleep 30
               continue
             fi
@@ -88,7 +111,8 @@ jobs:
 
             if is_ready "$newest_id"; then
               echo "Newest run #$newest_number is READY. Cancelling every older active run."
-              jq -r --arg target "$newest_id" '.[] | select((.id|tostring) != $target) | .id' <<<"$active" | while read -r old_id; do
+              jq -r --arg target "$newest_id" '.[] | select((.id|tostring) != $target) | .id' <<<"$active" |
+              while read -r old_id; do
                 [[ -z "$old_id" ]] && continue
                 cancel_run "$old_id"
               done
@@ -97,10 +121,10 @@ jobs:
               created="$(date -u -d "$newest_created" +%s)"
               age_minutes=$(( (now - created) / 60 ))
 
-              if (( age_minutes >= HANDOVER_MINUTES )); then
+              if (( age_minutes >= BOT_HANDOVER_MINUTES )); then
                 echo "Newest run #$newest_number is $age_minutes minutes old and is not READY yet."
-                echo "Starting a successor; the current run will remain until the successor is READY."
-                dispatch_new
+                echo "Starting a successor bot; current run remains until successor is READY."
+                dispatch_bot
                 sleep 60
                 continue
               fi
