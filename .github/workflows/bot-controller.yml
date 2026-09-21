@@ -3,10 +3,14 @@ name: TohidMusic Controller
 on:
   workflow_run:
     workflows: ["Run TohidMusic"]
-    types: [requested, in_progress, completed]
+    types: [completed]
+  workflow_dispatch:
   schedule:
     - cron: "*/5 * * * *"
-  workflow_dispatch:
+
+concurrency:
+  group: tohidmusic-controller
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -15,10 +19,10 @@ permissions:
 jobs:
   reconcile:
     runs-on: ubuntu-latest
-    timeout-minutes: 18
+    timeout-minutes: 350
 
     steps:
-      - name: Reconcile bot runners
+      - name: Watch and reconcile bot runners
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
@@ -28,100 +32,79 @@ jobs:
           REPO="$GITHUB_REPOSITORY"
           WORKFLOW="run-bot.yml"
           BRANCH="dev"
-
-          list_runs() {
-            gh api --paginate               -H "Accept: application/vnd.github+json"               "/repos/$REPO/actions/workflows/$WORKFLOW/runs?branch=$BRANCH&per_page=100"               --jq '.workflow_runs[] | {id, status, conclusion, created_at, run_number}'               2>/dev/null
-          }
-
-          latest_run_json() {
-            list_runs | jq -s 'sort_by(.created_at) | last // empty'
-          }
-
-          active_runs_json() {
-            list_runs | jq -s '
-              map(select(
-                .status == "queued" or
-                .status == "in_progress" or
-                .status == "waiting" or
-                .status == "pending" or
-                .status == "requested"
-              ))
-              | sort_by(.created_at)
-            '
-          }
+          HANDOVER_MINUTES=335
 
           dispatch_new() {
-            echo "No usable active bot run exists; dispatching a replacement."
+            echo "Dispatching a new bot runner..."
             gh workflow run "$WORKFLOW" --repo "$REPO" --ref "$BRANCH"
+            echo "Dispatch requested."
           }
 
-          latest="$(latest_run_json || true)"
+          runs_json() {
+            gh api --paginate \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/$REPO/actions/workflows/$WORKFLOW/runs?branch=$BRANCH&per_page=100" \
+              | jq '[.workflow_runs[] | {id,status,conclusion,created_at,run_started_at,run_number}]'
+          }
 
-          if [[ -z "$latest" ]]; then
-            dispatch_new
-            exit 0
-          fi
+          active_json() {
+            runs_json | jq '[.[] | select(.status == "queued" or .status == "in_progress" or .status == "waiting" or .status == "pending" or .status == "requested") | .] | sort_by(.created_at)'
+          }
 
-          latest_id="$(jq -r '.id' <<<"$latest")"
-          latest_status="$(jq -r '.status' <<<"$latest")"
+          is_ready() {
+            local run_id="$1"
+            gh api \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/$REPO/actions/runs/$run_id/jobs?per_page=100" \
+              | jq -e '[.jobs[].steps[]? | select(.name == "Verify bot ready" and .conclusion == "success")] | length > 0' >/dev/null
+          }
 
-          echo "Latest Run #$(jq -r '.run_number' <<<"$latest") ($latest_id) status=$latest_status"
+          cancel_run() {
+            local run_id="$1"
+            echo "Cancelling old run $run_id"
+            gh api --method POST \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/$REPO/actions/runs/$run_id/cancel" >/dev/null || true
+          }
 
-          if [[ "$latest_status" != "queued" && "$latest_status" != "in_progress" && "$latest_status" != "waiting" && "$latest_status" != "pending" && "$latest_status" != "requested" ]]; then
-            dispatch_new
-            exit 0
-          fi
+          echo "Controller started. It will keep watching until the controller job reaches its own limit."
 
-          for attempt in $(seq 1 60); do
-            active="$(active_runs_json)"
+          while true; do
+            active="$(active_json)"
             count="$(jq 'length' <<<"$active")"
 
             if (( count == 0 )); then
               dispatch_new
-              exit 0
+              sleep 30
+              continue
             fi
 
             newest="$(jq 'last' <<<"$active")"
-            target_id="$(jq -r '.id' <<<"$newest")"
-            target_number="$(jq -r '.run_number' <<<"$newest")"
+            newest_id="$(jq -r '.id' <<<"$newest")"
+            newest_number="$(jq -r '.run_number' <<<"$newest")"
+            newest_created="$(jq -r '.created_at' <<<"$newest")"
 
-            echo "Current newest active run: #$target_number ($target_id)"
+            echo "Newest active bot run: #$newest_number ($newest_id), created $newest_created"
 
-            jobs="$(gh api               -H "Accept: application/vnd.github+json"               "/repos/$REPO/actions/runs/$target_id/jobs?per_page=100")"
+            if is_ready "$newest_id"; then
+              echo "Newest run #$newest_number is READY. Cancelling every older active run."
+              jq -r --arg target "$newest_id" '.[] | select((.id|tostring) != $target) | .id' <<<"$active" | while read -r old_id; do
+                [[ -z "$old_id" ]] && continue
+                cancel_run "$old_id"
+              done
+            else
+              now="$(date -u +%s)"
+              created="$(date -u -d "$newest_created" +%s)"
+              age_minutes=$(( (now - created) / 60 ))
 
-            ready_count="$(jq '[.jobs[].steps[]? | select(.name == "Verify bot ready" and .conclusion == "success")] | length' <<<"$jobs")"
-
-            if (( ready_count > 0 )); then
-              latest_now="$(latest_run_json || true)"
-
-              if [[ -n "$latest_now" && "$(jq -r '.id' <<<"$latest_now")" == "$target_id" ]]; then
-                echo "Newest run #$target_number is verified READY. Cleaning up every other active run."
-
-                active="$(active_runs_json)"
-                jq -r --arg target "$target_id" '.[] | select((.id|tostring) != $target) | .id' <<<"$active" |
-                while read -r old_id; do
-                  [[ -z "$old_id" ]] && continue
-                  echo "Cancelling old/duplicate run $old_id"
-                  gh api --method POST                     -H "Accept: application/vnd.github+json"                     "/repos/$REPO/actions/runs/$old_id/cancel" >/dev/null || true
-                done
-
-                sleep 10
-
-                active="$(active_runs_json)"
-                jq -r --arg target "$target_id" '.[] | select((.id|tostring) != $target) | .id' <<<"$active" |
-                while read -r old_id; do
-                  [[ -z "$old_id" ]] && continue
-                  echo "Force-cancelling remaining old/duplicate run $old_id"
-                  gh api --method POST                     -H "Accept: application/vnd.github+json"                     "/repos/$REPO/actions/runs/$old_id/force-cancel" >/dev/null || true
-                done
-
-                echo "Run #$target_number is now the selected active bot."
-                exit 0
+              if (( age_minutes >= HANDOVER_MINUTES )); then
+                echo "Newest run #$newest_number is $age_minutes minutes old and is not READY yet."
+                echo "Starting a successor; the current run will remain until the successor is READY."
+                dispatch_new
+                sleep 60
+                continue
               fi
             fi
 
-            sleep 10
+            sleep 30
           done
-
-          echo "Controller timed out while waiting for the newest run to become ready."
-          echo "The 5-minute scheduled controller will retry automatically."
