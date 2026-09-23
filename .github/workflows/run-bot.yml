@@ -128,28 +128,38 @@ jobs:
       - name: Verify bot ready
         run: |
           set -euo pipefail
+
           pid_file="$RUNNER_TEMP/tohidmusic-bot.pid"
+          log_file="$RUNNER_TEMP/tohidmusic-bot.log"
 
           for attempt in $(seq 1 60); do
             if [[ -f "$pid_file" ]]; then
               pid="$(cat "$pid_file")"
+
               if ! kill -0 "$pid" 2>/dev/null; then
-                echo "Bot process exited before readiness check."
+                echo "❌ Bot process exited before readiness check."
+                echo
+                echo "========== BOT LOG =========="
+                cat "$log_file" || true
+                echo "========== END BOT LOG =========="
                 exit 1
               fi
             fi
 
             if curl -sS --max-time 3 -o /dev/null http://127.0.0.1:8000/; then
-              echo "Bot is ready: HTTP server is responding on port 8000."
+              echo "✅ Bot is ready: HTTP server is responding on port 8000."
               exit 0
             fi
 
             sleep 2
           done
 
-          echo "Bot did not become ready within 120 seconds."
+          echo "❌ Bot did not become ready within 120 seconds."
+          echo
+          echo "========== BOT LOG =========="
+          cat "$log_file" || true
+          echo "========== END BOT LOG =========="
           exit 1
-
       - name: Schedule successor
         id: successor
         env:
