@@ -104,10 +104,25 @@ jobs:
       - name: Start bot
         id: bot
         run: |
-          set -euo pipefail
-          ./app &
-          echo $! > "$RUNNER_TEMP/tohidmusic-bot.pid"
-          wait $!
+          set -uo pipefail
+
+          LOG="$RUNNER_TEMP/tohidmusic-bot.log"
+
+          ./app > "$LOG" 2>&1 &
+          PID=$!
+
+          echo "$PID" > "$RUNNER_TEMP/tohidmusic-bot.pid"
+
+          sleep 5
+
+          if ! kill -0 "$PID" 2>/dev/null; then
+            echo "Bot exited during startup."
+            echo "===== BOT LOG ====="
+            cat "$LOG"
+            exit 1
+          fi
+
+          echo "Bot started with PID $PID"
         background: true
 
       - name: Verify bot ready
