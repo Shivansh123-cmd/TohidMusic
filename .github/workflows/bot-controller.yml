@@ -1,22 +1,15 @@
 name: TohidMusic Controller
 
 on:
-  workflow_run:
-    workflows: ["Run TohidMusic"]
-    types: [completed]
-
   workflow_dispatch:
-
-  schedule:
-    - cron: "*/5 * * * *"
-
-concurrency:
-  group: tohidmusic-controller
-  cancel-in-progress: true
 
 permissions:
   contents: read
   actions: write
+
+concurrency:
+  group: tohidmusic-controller
+  cancel-in-progress: false
 
 jobs:
   reconcile:
@@ -24,7 +17,7 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      - name: Watch, restart and hand over controller
+      - name: Safe bot watchdog and session handover
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -33,7 +26,7 @@ jobs:
           set -euo pipefail
 
           REPO="$GITHUB_REPOSITORY"
-          WORKFLOW="run-bot.yml"
+          BOT_WORKFLOW="run-bot.yml"
           CONTROLLER_WORKFLOW="bot-controller.yml"
           BRANCH="dev"
 
@@ -41,56 +34,23 @@ jobs:
           CONTROLLER_HANDOVER_MINUTES=335
 
           controller_started="$(date -u +%s)"
-          controller_handover_done="false"
 
-
-          # ============================================================
-          # DISPATCH BOT
-          # ============================================================
-
-          dispatch_bot() {
-            echo "----------------------------------------"
-            echo "Dispatching new bot..."
-            echo "----------------------------------------"
-
-            gh workflow run "$WORKFLOW" \
-              --repo "$REPO" \
-              --ref "$BRANCH"
-
-            echo "Bot dispatch requested."
-          }
-
-
-          # ============================================================
-          # DISPATCH SUCCESSOR CONTROLLER
-          # ============================================================
-
-          dispatch_controller() {
-            if [[ "$controller_handover_done" == "true" ]]; then
-              return
-            fi
-
-            controller_handover_done="true"
-
-            echo "Starting successor controller..."
-
-            gh workflow run "$CONTROLLER_WORKFLOW" \
-              --repo "$REPO" \
-              --ref "$BRANCH"
-
-            echo "Successor controller dispatched."
-          }
+          echo "========================================"
+          echo "TohidMusic Controller started"
+          echo "Single Telegram assistant session mode"
+          echo "Duplicate-run protection: ENABLED"
+          echo "========================================"
 
 
           # ============================================================
           # GET ALL BOT RUNS
           # ============================================================
 
-          runs_json() {
+          get_bot_runs() {
             gh api \
               --paginate \
               -H "Accept: application/vnd.github+json" \
-              "/repos/$REPO/actions/workflows/$WORKFLOW/runs?branch=$BRANCH&per_page=100" \
+              "/repos/$REPO/actions/workflows/$BOT_WORKFLOW/runs?branch=$BRANCH&per_page=100" \
               --jq '.workflow_runs[]' |
             jq -s '
               [
@@ -100,7 +60,6 @@ jobs:
                   status: .status,
                   conclusion: .conclusion,
                   created_at: .created_at,
-                  run_started_at: .run_started_at,
                   run_number: .run_number
                 }
               ]
@@ -109,11 +68,11 @@ jobs:
 
 
           # ============================================================
-          # GET ACTIVE BOT RUNS
+          # ACTIVE BOT RUNS
           # ============================================================
 
-          active_json() {
-            runs_json |
+          get_active_bots() {
+            get_bot_runs |
             jq '
               [
                 .[] |
@@ -131,24 +90,10 @@ jobs:
 
 
           # ============================================================
-          # GET RUN STATUS
+          # BOT READY CHECK
           # ============================================================
 
-          get_run_status() {
-            local run_id="$1"
-
-            gh api \
-              -H "Accept: application/vnd.github+json" \
-              "/repos/$REPO/actions/runs/$run_id" \
-              --jq '.status'
-          }
-
-
-          # ============================================================
-          # CHECK BOT READY
-          # ============================================================
-
-          is_ready() {
+          bot_is_ready() {
             local run_id="$1"
 
             gh api \
@@ -171,10 +116,10 @@ jobs:
           # CANCEL BOT
           # ============================================================
 
-          cancel_run() {
+          cancel_bot() {
             local run_id="$1"
 
-            echo "Cancelling bot run: $run_id"
+            echo "Cancelling bot run #$run_id"
 
             gh api \
               --method POST \
@@ -185,78 +130,150 @@ jobs:
 
 
           # ============================================================
-          # WAIT UNTIL BOT COMPLETELY STOPS
+          # WAIT FOR COMPLETE STOP
           # ============================================================
 
-          wait_for_stop() {
+          wait_until_completed() {
             local run_id="$1"
 
-            echo "Waiting for run $run_id to completely stop..."
+            echo "Waiting for bot run #$run_id to completely stop..."
 
-            for attempt in $(seq 1 60); do
+            for attempt in $(seq 1 72); do
 
-              status="$(get_run_status "$run_id" || echo "unknown")"
+              status="$(
+                gh api \
+                  -H "Accept: application/vnd.github+json" \
+                  "/repos/$REPO/actions/runs/$run_id" \
+                  --jq '.status' 2>/dev/null || echo "unknown"
+              )"
 
-              echo "Run $run_id status: $status"
+              echo "Run #$run_id status: $status"
 
-              case "$status" in
-                completed)
-                  echo "Run $run_id has completely stopped."
-                  return 0
-                  ;;
+              if [[ "$status" == "completed" ]]; then
+                echo "Run #$run_id completely stopped."
+                return 0
+              fi
 
-                *)
-                  sleep 5
-                  ;;
-              esac
-
+              sleep 5
             done
 
-            echo "Run $run_id did not stop within the wait period."
+            echo "Run #$run_id did not stop within 6 minutes."
             return 1
           }
 
 
           # ============================================================
-          # STOP ALL ACTIVE BOT RUNS
+          # START BOT ONLY WHEN ZERO BOT RUNS EXIST
           # ============================================================
 
-          stop_all_active_bots() {
-            local active="$1"
+          start_bot_if_none() {
 
-            echo "Stopping all active bot runs..."
+            active="$(get_active_bots)"
+            count="$(jq -r 'length' <<< "$active")"
 
-            jq -r '.[].id' <<< "$active" |
-            while read -r run_id; do
+            echo "Current active bot runs: $count"
 
-              if [[ -n "$run_id" ]]; then
-                cancel_run "$run_id"
-              fi
+            if (( count > 0 )); then
+              echo "A bot is already active. NOT starting another bot."
+              return 0
+            fi
 
-            done
+            echo "No active bot exists."
+            echo "Starting exactly ONE bot..."
 
+            gh workflow run "$BOT_WORKFLOW" \
+              --repo "$REPO" \
+              --ref "$BRANCH"
 
-            jq -r '.[].id' <<< "$active" |
-            while read -r run_id; do
-
-              if [[ -n "$run_id" ]]; then
-                wait_for_stop "$run_id" || true
-              fi
-
-            done
+            echo "Bot dispatch requested."
           }
 
 
           # ============================================================
-          # START
+          # SAFE HANDOVER
           # ============================================================
 
-          echo "========================================"
-          echo "TohidMusic Controller"
-          echo "Bot watchdog: ACTIVE"
-          echo "Safe session handover: ACTIVE"
-          echo "Controller self-handover: ACTIVE"
-          echo "========================================"
+          safe_handover() {
+
+            echo "========================================"
+            echo "Starting SAFE bot handover"
+            echo "========================================"
+
+            active="$(get_active_bots)"
+            count="$(jq -r 'length' <<< "$active")"
+
+            if (( count == 0 )); then
+              echo "No bot is running."
+              start_bot_if_none
+              return 0
+            fi
+
+
+            echo "Active bot runs before handover: $count"
+
+
+            # ----------------------------------------------------------
+            # Cancel every active bot.
+            # This guarantees the assistant session is not shared by
+            # multiple GitHub runners.
+            # ----------------------------------------------------------
+
+            jq -r '.[].id' <<< "$active" |
+            while read -r run_id; do
+
+              [[ -z "$run_id" ]] && continue
+
+              cancel_bot "$run_id"
+
+            done
+
+
+            # ----------------------------------------------------------
+            # Wait for EVERY old runner to completely finish.
+            # ----------------------------------------------------------
+
+            jq -r '.[].id' <<< "$active" |
+            while read -r run_id; do
+
+              [[ -z "$run_id" ]] && continue
+
+              if ! wait_until_completed "$run_id"; then
+                echo "Old bot #$run_id is still active."
+                echo "NOT starting a successor."
+                return 1
+              fi
+
+            done
+
+
+            # ----------------------------------------------------------
+            # Final verification.
+            # ----------------------------------------------------------
+
+            sleep 5
+
+            remaining="$(get_active_bots)"
+            remaining_count="$(jq -r 'length' <<< "$remaining")"
+
+            echo "Active bots after handover: $remaining_count"
+
+
+            if (( remaining_count != 0 )); then
+              echo "A bot runner is still active."
+              echo "Successor will NOT be started."
+              return 1
+            fi
+
+
+            # ----------------------------------------------------------
+            # NOW it is safe to start the next assistant session.
+            # ----------------------------------------------------------
+
+            echo "All old bot runners are completely stopped."
+            echo "Starting exactly ONE successor bot."
+
+            start_bot_if_none
+          }
 
 
           # ============================================================
@@ -267,7 +284,7 @@ jobs:
 
             echo ""
             echo "========================================"
-            echo "Checking TohidMusic..."
+            echo "Controller check"
             echo "========================================"
 
 
@@ -275,8 +292,11 @@ jobs:
             # CONTROLLER AGE
             # ----------------------------------------------------------
 
-            controller_now="$(date -u +%s)"
-            controller_age_minutes=$(( (controller_now - controller_started) / 60 ))
+            now="$(date -u +%s)"
+
+            controller_age_minutes=$(
+              (now - controller_started) / 60
+            )
 
             echo "Controller age: ${controller_age_minutes} minutes"
 
@@ -287,10 +307,15 @@ jobs:
 
             if (( controller_age_minutes >= CONTROLLER_HANDOVER_MINUTES )); then
 
-              echo "Controller reached handover limit."
+              echo "Controller reached 335 minutes."
 
-              dispatch_controller
+              echo "Starting successor controller FIRST."
 
+              gh workflow run "$CONTROLLER_WORKFLOW" \
+                --repo "$REPO" \
+                --ref "$BRANCH"
+
+              echo "Successor controller started."
               echo "Current controller exiting."
 
               exit 0
@@ -298,33 +323,69 @@ jobs:
 
 
             # ----------------------------------------------------------
-            # GET ACTIVE BOTS
+            # CHECK ACTIVE BOTS
             # ----------------------------------------------------------
 
-            active="$(active_json)"
+            active="$(get_active_bots)"
             count="$(jq -r 'length' <<< "$active")"
 
             echo "Active bot runs: $count"
 
 
             # ----------------------------------------------------------
-            # NO BOT RUNNING
+            # NO BOT
             # ----------------------------------------------------------
 
             if (( count == 0 )); then
 
               echo "No active bot found."
 
-              dispatch_bot
+              start_bot_if_none
 
               sleep 30
+              continue
+            fi
+
+
+            # ----------------------------------------------------------
+            # MORE THAN ONE BOT
+            # ----------------------------------------------------------
+
+            if (( count > 1 )); then
+
+              echo "WARNING: Multiple bot runs detected."
+              echo "Protecting the Telegram assistant session."
+
+
+              # Keep the newest run only.
+              newest_id="$(jq -r 'last.id' <<< "$active")"
+
+              echo "Newest run to inspect: $newest_id"
+
+
+              jq -r \
+                --arg keep "$newest_id" \
+                '.[] |
+                 select((.id | tostring) != $keep) |
+                 .id' \
+                <<< "$active" |
+              while read -r old_id; do
+
+                [[ -z "$old_id" ]] && continue
+
+                cancel_bot "$old_id"
+
+              done
+
+
+              sleep 10
 
               continue
             fi
 
 
             # ----------------------------------------------------------
-            # GET NEWEST BOT
+            # EXACTLY ONE BOT
             # ----------------------------------------------------------
 
             newest="$(jq -c 'last' <<< "$active")"
@@ -334,59 +395,30 @@ jobs:
             newest_created="$(jq -r '.created_at // empty' <<< "$newest")"
 
 
-            if [[ -z "$newest_id" || -z "$newest_number" || -z "$newest_created" ]]; then
+            if [[ -z "$newest_id" || -z "$newest_created" ]]; then
 
-              echo "Invalid bot run data."
-              echo "$newest"
-
+              echo "Invalid bot information."
               sleep 30
-
               continue
+
             fi
 
 
-            echo "Newest bot: #$newest_number"
-            echo "Run ID: $newest_id"
-            echo "Created: $newest_created"
+            echo "Bot #$newest_number is the only active bot."
 
 
             # ----------------------------------------------------------
-            # CHECK READY
+            # READY
             # ----------------------------------------------------------
 
-            if is_ready "$newest_id"; then
+            if bot_is_ready "$newest_id"; then
 
               echo "Bot #$newest_number is READY."
-
-
-              # --------------------------------------------------------
-              # If there are duplicate active runs, stop the older ones.
-              # --------------------------------------------------------
-
-              if (( count > 1 )); then
-
-                echo "Multiple active bot runs detected."
-
-                older_runs="$(
-                  jq -c \
-                    --arg target "$newest_id" \
-                    '[.[] | select((.id | tostring) != $target)]' \
-                    <<< "$active"
-                )"
-
-                stop_all_active_bots "$older_runs"
-
-              fi
-
+              echo "Keeping it alive."
 
             else
 
-              echo "Bot #$newest_number is NOT READY."
-
-
-              # --------------------------------------------------------
-              # BOT AGE
-              # --------------------------------------------------------
+              echo "Bot #$newest_number is not READY yet."
 
               now="$(date -u +%s)"
               created="$(date -u -d "$newest_created" +%s)"
@@ -397,60 +429,18 @@ jobs:
 
 
               # --------------------------------------------------------
-              # OLD BOT / SAFE HANDOVER
+              # If startup is stuck for 335 minutes, perform safe
+              # handover. Old runner is stopped BEFORE successor starts.
               # --------------------------------------------------------
 
               if (( age_minutes >= BOT_HANDOVER_MINUTES )); then
 
-                echo "========================================"
-                echo "Bot #$newest_number reached handover time."
-                echo "Preparing SAFE Telegram session handover."
-                echo "========================================"
+                safe_handover
 
-
-                # IMPORTANT:
-                # Do NOT start the successor while the old bot is alive.
-                # First cancel and wait for complete termination.
-
-                stop_all_active_bots "$active"
-
-
-                # Verify that no active bot remains.
-
-                remaining="$(active_json)"
-                remaining_count="$(jq -r 'length' <<< "$remaining")"
-
-                echo "Active bots after cancellation: $remaining_count"
-
-
-                if (( remaining_count == 0 )); then
-
-                  echo "Old bot completely stopped."
-                  echo "Starting successor bot..."
-
-                  dispatch_bot
-
-                else
-
-                  echo "An old bot is still active."
-                  echo "Will retry on next controller cycle."
-
-                fi
-
-
-                sleep 30
-
-                continue
               fi
 
             fi
 
-
-            # ----------------------------------------------------------
-            # NORMAL WATCHDOG
-            # ----------------------------------------------------------
-
-            echo "Bot is being monitored."
 
             sleep 30
 
