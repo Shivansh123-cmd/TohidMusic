@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   reconcile:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 350
 
     steps:
@@ -43,19 +43,15 @@ jobs:
           controller_started="$(date -u +%s)"
           controller_handover_done="false"
 
-          echo "========================================"
-          echo "TohidMusic Controller started"
-          echo "Bot watchdog: ACTIVE"
-          echo "Controller self-handover: ACTIVE"
-          echo "========================================"
 
-
-          # ------------------------------------------------------------
-          # Start a new bot
-          # ------------------------------------------------------------
+          # ============================================================
+          # DISPATCH BOT
+          # ============================================================
 
           dispatch_bot() {
-            echo "Dispatching a new bot runner..."
+            echo "----------------------------------------"
+            echo "Dispatching new bot..."
+            echo "----------------------------------------"
 
             gh workflow run "$WORKFLOW" \
               --repo "$REPO" \
@@ -65,13 +61,12 @@ jobs:
           }
 
 
-          # ------------------------------------------------------------
-          # Start successor controller
-          # ------------------------------------------------------------
+          # ============================================================
+          # DISPATCH SUCCESSOR CONTROLLER
+          # ============================================================
 
           dispatch_controller() {
             if [[ "$controller_handover_done" == "true" ]]; then
-              echo "Controller handover already requested."
               return
             fi
 
@@ -83,13 +78,13 @@ jobs:
               --repo "$REPO" \
               --ref "$BRANCH"
 
-            echo "Successor controller dispatch requested."
+            echo "Successor controller dispatched."
           }
 
 
-          # ------------------------------------------------------------
-          # Get bot workflow runs
-          # ------------------------------------------------------------
+          # ============================================================
+          # GET ALL BOT RUNS
+          # ============================================================
 
           runs_json() {
             gh api \
@@ -113,9 +108,9 @@ jobs:
           }
 
 
-          # ------------------------------------------------------------
-          # Get only active bot runs
-          # ------------------------------------------------------------
+          # ============================================================
+          # GET ACTIVE BOT RUNS
+          # ============================================================
 
           active_json() {
             runs_json |
@@ -135,9 +130,23 @@ jobs:
           }
 
 
-          # ------------------------------------------------------------
-          # Check whether bot is ready
-          # ------------------------------------------------------------
+          # ============================================================
+          # GET RUN STATUS
+          # ============================================================
+
+          get_run_status() {
+            local run_id="$1"
+
+            gh api \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/$REPO/actions/runs/$run_id" \
+              --jq '.status'
+          }
+
+
+          # ============================================================
+          # CHECK BOT READY
+          # ============================================================
 
           is_ready() {
             local run_id="$1"
@@ -158,14 +167,14 @@ jobs:
           }
 
 
-          # ------------------------------------------------------------
-          # Cancel an old bot run
-          # ------------------------------------------------------------
+          # ============================================================
+          # CANCEL BOT
+          # ============================================================
 
           cancel_run() {
             local run_id="$1"
 
-            echo "Cancelling old run: $run_id"
+            echo "Cancelling bot run: $run_id"
 
             gh api \
               --method POST \
@@ -176,19 +185,94 @@ jobs:
 
 
           # ============================================================
+          # WAIT UNTIL BOT COMPLETELY STOPS
+          # ============================================================
+
+          wait_for_stop() {
+            local run_id="$1"
+
+            echo "Waiting for run $run_id to completely stop..."
+
+            for attempt in $(seq 1 60); do
+
+              status="$(get_run_status "$run_id" || echo "unknown")"
+
+              echo "Run $run_id status: $status"
+
+              case "$status" in
+                completed)
+                  echo "Run $run_id has completely stopped."
+                  return 0
+                  ;;
+
+                *)
+                  sleep 5
+                  ;;
+              esac
+
+            done
+
+            echo "Run $run_id did not stop within the wait period."
+            return 1
+          }
+
+
+          # ============================================================
+          # STOP ALL ACTIVE BOT RUNS
+          # ============================================================
+
+          stop_all_active_bots() {
+            local active="$1"
+
+            echo "Stopping all active bot runs..."
+
+            jq -r '.[].id' <<< "$active" |
+            while read -r run_id; do
+
+              if [[ -n "$run_id" ]]; then
+                cancel_run "$run_id"
+              fi
+
+            done
+
+
+            jq -r '.[].id' <<< "$active" |
+            while read -r run_id; do
+
+              if [[ -n "$run_id" ]]; then
+                wait_for_stop "$run_id" || true
+              fi
+
+            done
+          }
+
+
+          # ============================================================
+          # START
+          # ============================================================
+
+          echo "========================================"
+          echo "TohidMusic Controller"
+          echo "Bot watchdog: ACTIVE"
+          echo "Safe session handover: ACTIVE"
+          echo "Controller self-handover: ACTIVE"
+          echo "========================================"
+
+
+          # ============================================================
           # MAIN LOOP
           # ============================================================
 
           while true; do
 
             echo ""
-            echo "----------------------------------------"
-            echo "Checking controller..."
-            echo "----------------------------------------"
+            echo "========================================"
+            echo "Checking TohidMusic..."
+            echo "========================================"
 
 
             # ----------------------------------------------------------
-            # Controller age
+            # CONTROLLER AGE
             # ----------------------------------------------------------
 
             controller_now="$(date -u +%s)"
@@ -198,46 +282,49 @@ jobs:
 
 
             # ----------------------------------------------------------
-            # Controller handover
+            # CONTROLLER HANDOVER
             # ----------------------------------------------------------
 
             if (( controller_age_minutes >= CONTROLLER_HANDOVER_MINUTES )); then
+
               echo "Controller reached handover limit."
 
               dispatch_controller
 
-              sleep 30
-              continue
+              echo "Current controller exiting."
+
+              exit 0
             fi
 
 
             # ----------------------------------------------------------
-            # Get active bot runs
+            # GET ACTIVE BOTS
             # ----------------------------------------------------------
 
             active="$(active_json)"
-
             count="$(jq -r 'length' <<< "$active")"
 
             echo "Active bot runs: $count"
 
 
             # ----------------------------------------------------------
-            # No active bot
+            # NO BOT RUNNING
             # ----------------------------------------------------------
 
             if (( count == 0 )); then
+
               echo "No active bot found."
 
               dispatch_bot
 
               sleep 30
+
               continue
             fi
 
 
             # ----------------------------------------------------------
-            # Get newest active bot
+            # GET NEWEST BOT
             # ----------------------------------------------------------
 
             newest="$(jq -c 'last' <<< "$active")"
@@ -247,55 +334,58 @@ jobs:
             newest_created="$(jq -r '.created_at // empty' <<< "$newest")"
 
 
-            # ----------------------------------------------------------
-            # Validate newest run
-            # ----------------------------------------------------------
-
             if [[ -z "$newest_id" || -z "$newest_number" || -z "$newest_created" ]]; then
-              echo "Invalid bot run information received."
+
+              echo "Invalid bot run data."
               echo "$newest"
 
               sleep 30
+
               continue
             fi
 
 
-            echo "Newest active bot: #$newest_number"
+            echo "Newest bot: #$newest_number"
             echo "Run ID: $newest_id"
             echo "Created: $newest_created"
 
 
             # ----------------------------------------------------------
-            # Check READY status
+            # CHECK READY
             # ----------------------------------------------------------
 
             if is_ready "$newest_id"; then
 
               echo "Bot #$newest_number is READY."
-              echo "Cancelling older active bot runs..."
-
-
-              jq -r \
-                --arg target "$newest_id" \
-                '.[] |
-                 select((.id | tostring) != $target) |
-                 .id' \
-                <<< "$active" |
-              while read -r old_id; do
-
-                if [[ -n "$old_id" ]]; then
-                  cancel_run "$old_id"
-                fi
-
-              done
-
-            else
-
-              echo "Bot #$newest_number is not READY yet."
 
 
               # --------------------------------------------------------
-              # Calculate bot age
+              # If there are duplicate active runs, stop the older ones.
+              # --------------------------------------------------------
+
+              if (( count > 1 )); then
+
+                echo "Multiple active bot runs detected."
+
+                older_runs="$(
+                  jq -c \
+                    --arg target "$newest_id" \
+                    '[.[] | select((.id | tostring) != $target)]' \
+                    <<< "$active"
+                )"
+
+                stop_all_active_bots "$older_runs"
+
+              fi
+
+
+            else
+
+              echo "Bot #$newest_number is NOT READY."
+
+
+              # --------------------------------------------------------
+              # BOT AGE
               # --------------------------------------------------------
 
               now="$(date -u +%s)"
@@ -307,17 +397,49 @@ jobs:
 
 
               # --------------------------------------------------------
-              # Bot handover
+              # OLD BOT / SAFE HANDOVER
               # --------------------------------------------------------
 
               if (( age_minutes >= BOT_HANDOVER_MINUTES )); then
 
-                echo "Bot #$newest_number exceeded ${BOT_HANDOVER_MINUTES} minutes."
-                echo "Starting successor bot..."
+                echo "========================================"
+                echo "Bot #$newest_number reached handover time."
+                echo "Preparing SAFE Telegram session handover."
+                echo "========================================"
 
-                dispatch_bot
 
-                sleep 60
+                # IMPORTANT:
+                # Do NOT start the successor while the old bot is alive.
+                # First cancel and wait for complete termination.
+
+                stop_all_active_bots "$active"
+
+
+                # Verify that no active bot remains.
+
+                remaining="$(active_json)"
+                remaining_count="$(jq -r 'length' <<< "$remaining")"
+
+                echo "Active bots after cancellation: $remaining_count"
+
+
+                if (( remaining_count == 0 )); then
+
+                  echo "Old bot completely stopped."
+                  echo "Starting successor bot..."
+
+                  dispatch_bot
+
+                else
+
+                  echo "An old bot is still active."
+                  echo "Will retry on next controller cycle."
+
+                fi
+
+
+                sleep 30
+
                 continue
               fi
 
@@ -325,10 +447,10 @@ jobs:
 
 
             # ----------------------------------------------------------
-            # Watchdog interval
+            # NORMAL WATCHDOG
             # ----------------------------------------------------------
 
-            echo "Sleeping for 30 seconds..."
+            echo "Bot is being monitored."
 
             sleep 30
 
